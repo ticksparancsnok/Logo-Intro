@@ -113,6 +113,10 @@
     return location.hash.includes('/video') && !onTop;
   }
 
+  const mediaProto = (name) => Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, name);
+  const realPause = HTMLMediaElement.prototype.pause;
+  const realPlay = HTMLMediaElement.prototype.play;  
+
   function playIntro(main) {
     if (!main.parentElement) return;
     log('arming intro');
@@ -123,24 +127,51 @@
     clip.preload = 'auto';
     clip.playsInline = true;
     clip.src = new URL(CFG.clipUrl, location.href).href;
+    clip.volume = main.volume;
     clip.style.cssText =
       'position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000;pointer-events:none;';
 
-    const wasMuted = main.muted;
-    let t0 = 0, poll = null, done = false, clipStarted = false;
+    const userMuted = main.muted;       // the viewer's real mute state
+    let muted = userMuted;              // tracked through the overridden accessor
+    let t0 = 0, pendingSeek = null, poll = null, done = false, proxied = false, launched = false;
 
-    const hold = () => { if (clipStarted && !main.paused) main.pause(); };
+    const onVolume = () => { clip.volume = main.volume; };
+    main.addEventListener('volumechange', onVolume);
+
+    // make the main element's transport state follow the clip while it plays
+    const installProxy = () => {
+      proxied = true;
+      const own = (k, d) => Object.defineProperty(main, k, { configurable: true, ...d });
+      own('paused', { get: () => clip.paused });
+      own('pause', { value: () => { clip.pause(); main.dispatchEvent(new Event('pause')); } });
+      own('play', {
+        value: () => {
+          const p = clip.play();
+          main.dispatchEvent(new Event('play'));
+          return p;
+        },
+      });
+      own('muted', {
+        get: () => muted,
+        set: (v) => { muted = !!v; clip.muted = muted; main.dispatchEvent(new Event('volumechange')); },
+      });
+      own('currentTime', {
+        get: () => mediaProto('currentTime').get.call(main),
+        set: (v) => { pendingSeek = v; },             // seeks during the clip apply afterwards
+      });
+    };
 
     const cleanup = () => {
       if (done) return false;
       done = true;
       clearInterval(poll);
       main.removeEventListener('playing', onMainPlaying);
-      main.removeEventListener('playing', hold);
+      main.removeEventListener('volumechange', onVolume);
       clip.pause();
       clip.remove();
+      if (proxied) ['paused', 'pause', 'play', 'muted', 'currentTime'].forEach((k) => delete main[k]);
+      main.muted = proxied ? muted : userMuted;
       main.style.visibility = '';
-      if (!wasMuted) main.muted = false;
       document.documentElement.classList.remove('logo-intro-active');
       activeIntro = null;
       return true;
@@ -148,30 +179,43 @@
 
     const finish = () => {
       if (!cleanup() || !main.isConnected) return;
-      try { if (main.currentTime - t0 > 0.05) main.currentTime = t0; } catch { /* ignore */ }
-      main.play().catch(() => {});
+      const target = pendingSeek ?? t0;
+      try { if (Math.abs(main.currentTime - target) > 0.05) main.currentTime = target; } catch { /* ignore */ }
+      realPlay.call(main).catch(() => {});
     };
 
     const startClip = () => {
       if (done) return;
-      clipStarted = true;
-      main.pause();                                   // safe now: Jellyfin has finished its own start-up
-      main.after(clip);
-      main.style.visibility = 'hidden';               // clip takes the main video's place in the stack
-      document.documentElement.classList.add('logo-intro-active');
-      main.addEventListener('playing', hold);         // ignore play presses during the clip
-      clip.addEventListener('ended', finish);
-      clip.addEventListener('error', finish);
-      clip.play().catch(() => {
-        clip.muted = true;
-        clip.play().catch(finish);
-      });
+      realPause.call(main);                            // safe now: Jellyfin has finished its own start-up
+      // wait for the native 'pause' event to flush before faking transport state
+      const go = () => {
+        if (launched || done) return;
+        launched = true;
+        main.removeEventListener('pause', go);
+        main.after(clip);
+        main.style.visibility = 'hidden';
+        document.documentElement.classList.add('logo-intro-active');
+        installProxy();
+        clip.muted = muted;
+        clip.addEventListener('ended', finish);
+        clip.addEventListener('error', finish);
+        const flip = () => {
+          main.dispatchEvent(new Event('volumechange'));
+          main.dispatchEvent(new Event('play'));       // OSD flips to the "playing" state
+        };
+        clip.play().then(flip).catch(() => {
+          clip.muted = true;                           // autoplay-with-sound blocked -> retry muted
+          clip.play().then(flip).catch(finish);
+        });
+      };
+      main.addEventListener('pause', go);
+      setTimeout(go, 200);
     };
 
     function onMainPlaying() {
       main.removeEventListener('playing', onMainPlaying);
       t0 = main.currentTime;
-      if (!wasMuted) main.muted = true;               // no main-video audio while we wait
+      if (!userMuted) main.muted = true;               // no main-video audio while we wait
       const started = Date.now();
       poll = setInterval(() => {
         if (done) return;
